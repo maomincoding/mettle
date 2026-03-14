@@ -1,6 +1,6 @@
 {
   "name": "mettle",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "A approachable, fast, flexible JavaScript library for building user interfaces.",
   "main": "dist/mettle.full.js",
   "module": "dist/mettle.runtime-esm.js",
@@ -10,7 +10,8 @@
   "files": [
     "dist",
     "types",
-    "jsx-runtime.d.ts"
+    "jsx-runtime.d.ts",
+    "jsx.d.ts"
   ],
   "scripts": {
     "tsc": "tsc",
@@ -46,6 +47,9 @@
     "url": "https://github.com/maomincoding/mettle/issues"
   },
   "homepage": "https://github.com/maomincoding/mettle#readme",
+  "dependencies": {
+    "csstype": "^3.1.3"
+  },
   "devDependencies": {
     "@rollup/plugin-replace": "^5.0.2",
     "@rollup/plugin-terser": "^0.4.4",

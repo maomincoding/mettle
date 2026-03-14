@@ -1,5 +1,5 @@
 /*!
- * Mettle.js v1.8.0
+ * Mettle.js v1.8.1
  * (c) 2021-2026 maomincoding
  * Released under the MIT License.
  */
@@ -869,7 +869,7 @@ function memoCreateEl(oNode, nNode) {
     }
 }
 // version
-const version = '1.8.0';
+const version = '1.8.1';
 // Flag
 const isFlag = /* @__PURE__ */ makeMap('$ref,$once,$memo');
 // Component
