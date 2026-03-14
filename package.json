@@ -1,18 +1,28 @@
 {
   "name": "mettle",
-  "version": "1.8.1",
+  "version": "1.8.3",
   "description": "A approachable, fast, flexible JavaScript library for building user interfaces.",
-  "main": "dist/mettle.full.js",
-  "module": "dist/mettle.runtime-esm.js",
-  "unpkg": "dist/mettle.full.prod.js",
-  "jsdelivr": "dist/mettle.full.prod.js",
+  "main": "./dist/mettle.full.js",
+  "module": "./dist/mettle.runtime-esm.js",
+  "unpkg": "./dist/mettle.full.prod.js",
+  "jsdelivr": "./dist/mettle.full.prod.js",
   "types": "types/index.d.ts",
   "files": [
     "dist",
     "types",
-    "jsx-runtime.d.ts",
-    "jsx.d.ts"
+    "jsx.d.ts",
+    "lib/jsx-runtime.js"
   ],
+  "exports": {
+    ".": {
+      "import": "./dist/mettle.runtime-esm.js",
+      "types": "./types/index.d.ts"
+    },
+    "./jsx-runtime": {
+      "import": "./lib/jsx-runtime.js",
+      "types": "./types/jsx-runtime.d.ts"
+    }
+  },
   "scripts": {
     "tsc": "tsc",
     "build": "tsc && npm run build-red && npm run build-rep && npm run build-fed && npm run build-fep && npm run build-fd && npm run build-fp",

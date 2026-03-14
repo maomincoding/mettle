@@ -1,5 +1,5 @@
 /*!
- * Mettle.js v1.8.1
+ * Mettle.js v1.8.3
  * (c) 2021-2026 maomincoding
  * Released under the MIT License.
  */
@@ -1062,7 +1062,7 @@
         }
     }
     // version
-    const version = '1.8.1';
+    const version = '1.8.3';
     // Flag
     const isFlag = /* @__PURE__ */ makeMap('$ref,$once,$memo');
     // Component
