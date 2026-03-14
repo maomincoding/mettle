@@ -86,6 +86,7 @@ declare class Effect {
     _nextBatchedEffect?: Effect;
     _flags: number;
     name?: string;
+    _statsDisposed: boolean;
     constructor(fn: EffectFn, options?: EffectOptions);
     _callback(): void;
     _start(): () => void;

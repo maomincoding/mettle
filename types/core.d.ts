@@ -1,7 +1,11 @@
+declare function trackEffectCreated(): void;
+declare function trackEffectDisposed(effect: any): void;
+declare function getRuntimeStatsSnapshot(): any;
+declare function resetRuntimeStats(): void;
 declare const version: string;
 declare const domInfo: WeakMap<object, any>;
-declare function createApp(root: any, container: string): void;
-declare function onMounted(fn?: any): void;
-declare function onUnmounted(fn?: any): void;
-declare function resetView(view: any, routerContainer?: string): void;
-export { version, createApp, domInfo, onMounted, onUnmounted, resetView };
+declare function createApp(root: any, container: any): void;
+declare function onMounted(fn?: any | null): void;
+declare function onUnmounted(fn?: any | null): void;
+declare function resetView(view: any, routerContainer: any): void;
+export { version, createApp, domInfo, onMounted, onUnmounted, resetView, trackEffectDisposed, trackEffectCreated, getRuntimeStatsSnapshot, resetRuntimeStats, };

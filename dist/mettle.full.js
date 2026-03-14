@@ -1,6 +1,6 @@
 /*!
- * Mettle.js v1.7.6
- * (c) 2021-2025 maomincoding
+ * Mettle.js v1.8.0
+ * (c) 2021-2026 maomincoding
  * Released under the MIT License.
  */
 (function (global, factory) {
@@ -598,6 +598,7 @@
         }
     }
     function disposeEffect(effect) {
+        trackEffectDisposed(effect);
         for (let node = effect._sources; node !== undefined; node = node._nextSource) {
             node._source._unsubscribe(node);
         }
@@ -624,7 +625,9 @@
         this._sources = undefined;
         this._nextBatchedEffect = undefined;
         this._flags = TRACKING;
+        this._statsDisposed = false;
         this.name = options?.name;
+        trackEffectCreated();
     }
     Effect.prototype._callback = function () {
         const finish = this._start();
@@ -725,15 +728,203 @@
     const hasOwn = (val, key) => hasOwnProperty$1.call(val, key);
     const isObject = (val) => val !== null && typeof val === 'object';
     const isUndef = (v) => v === undefined || v === null;
+    const RUNTIME_FLAG_KEYS = {
+        strictErrors: '__METTLE_STRICT_ERRORS__',
+        compareFunctionProps: '__METTLE_COMPARE_FUNCTION_PROPS__',
+        debugLifecycle: '__METTLE_DEBUG_LIFECYCLE__',
+        componentPatchFirst: '__METTLE_COMPONENT_PATCH_FIRST__',
+        debugRuntimeStats: '__METTLE_DEBUG_RUNTIME_STATS__',
+    };
+    function readRuntimeFlag(flagKey) {
+        if (typeof globalThis === 'undefined')
+            return false;
+        return globalThis[flagKey] === true;
+    }
+    const RUNTIME_STATS_KEY = '__METTLE_RUNTIME_STATS__';
+    function getRuntimeStats() {
+        if (typeof globalThis === 'undefined')
+            return null;
+        if (!globalThis[RUNTIME_STATS_KEY]) {
+            globalThis[RUNTIME_STATS_KEY] = Object.create(null);
+        }
+        return globalThis[RUNTIME_STATS_KEY];
+    }
+    function incRuntimeStat(name, step = 1) {
+        if (!readRuntimeFlag(RUNTIME_FLAG_KEYS.debugRuntimeStats))
+            return;
+        const stats = getRuntimeStats();
+        if (!stats)
+            return;
+        const current = typeof stats[name] === 'number' ? stats[name] : 0;
+        stats[name] = current + step;
+    }
+    function trackEffectCreated() {
+        incRuntimeStat('effect.created');
+        incRuntimeStat('effect.active', 1);
+    }
+    function trackEffectDisposed(effect) {
+        if (effect && effect._statsDisposed)
+            return;
+        if (effect) {
+            effect._statsDisposed = true;
+        }
+        incRuntimeStat('effect.disposed');
+        incRuntimeStat('effect.active', -1);
+    }
+    function getRuntimeStatsSnapshot() {
+        const stats = getRuntimeStats();
+        if (!stats)
+            return {};
+        return { ...stats };
+    }
+    function resetRuntimeStats() {
+        if (typeof globalThis === 'undefined')
+            return;
+        globalThis[RUNTIME_STATS_KEY] = Object.create(null);
+    }
     const checkSameVnode = (o, n) => o.tag === n.tag && o.key === n.key;
     const notTagComponent = (oNode, nNode) => typeof oNode.tag !== 'function' && typeof nNode.tag !== 'function';
     const isVnode = (vnode) => vnode != null && (typeof vnode === 'object' ? 'tag' in vnode : false);
     const isTextChildren = (children) => !isVnode(children) && !Array.isArray(children);
+    const isEventPropKey = (key) => /^on[A-Z]/.test(key);
+    const shouldCompareFunctionProps = () => readRuntimeFlag(RUNTIME_FLAG_KEYS.compareFunctionProps);
+    const shouldUseComponentPatchFirst = () => {
+        if (typeof globalThis === 'undefined')
+            return true;
+        // Default to patch-first for better update performance.
+        // Only disable when explicitly set to false.
+        return globalThis[RUNTIME_FLAG_KEYS.componentPatchFirst] !== false;
+    };
+    const shallowEqualObject = (a, b) => {
+        if (a === b)
+            return true;
+        if (!isObject(a) || !isObject(b))
+            return false;
+        const aKeys = Object.keys(a);
+        const bKeys = Object.keys(b);
+        if (aKeys.length !== bKeys.length)
+            return false;
+        for (let i = 0; i < aKeys.length; i++) {
+            const key = aKeys[i];
+            if (a[key] !== b[key])
+                return false;
+        }
+        return true;
+    };
+    const hasChangedProps = (oldProps, newProps) => {
+        const oldKeys = Object.keys(oldProps);
+        const newKeys = Object.keys(newProps);
+        if (oldKeys.length !== newKeys.length)
+            return true;
+        for (let i = 0; i < newKeys.length; i++) {
+            const key = newKeys[i];
+            const oldValue = oldProps[key];
+            const newValue = newProps[key];
+            // Event handlers are often recreated per render. Ignore by default.
+            // Set globalThis.__METTLE_COMPARE_FUNCTION_PROPS__ = true to compare all functions.
+            if (typeof oldValue === 'function' && typeof newValue === 'function') {
+                if (!shouldCompareFunctionProps() && isEventPropKey(key)) {
+                    continue;
+                }
+                if (oldValue !== newValue) {
+                    return true;
+                }
+                continue;
+            }
+            // Avoid remount when style objects are structurally equal.
+            if (key === 'style' && isObject(oldValue) && isObject(newValue)) {
+                if (!shallowEqualObject(oldValue, newValue)) {
+                    return true;
+                }
+                continue;
+            }
+            if (oldValue !== newValue) {
+                return true;
+            }
+        }
+        return false;
+    };
     function warn(msg) {
         console.warn(`[Mettle.js warn]: ${msg}`);
     }
-    function setStyleProp(el, prototype) {
-        Object.assign(el.style, prototype);
+    function safeRemoveChild(parent, child, context = 'unknown') {
+        incRuntimeStat('safeRemoveChild.call');
+        if (!parent || !child) {
+            incRuntimeStat('safeRemoveChild.fail.missing_node');
+            warn(`[safeRemoveChild:${context}] parent or child is missing.`);
+            if (readRuntimeFlag(RUNTIME_FLAG_KEYS.strictErrors)) {
+                throw new TypeError(`[safeRemoveChild:${context}] parent or child is missing.`);
+            }
+            return false;
+        }
+        if (child.parentNode !== parent) {
+            incRuntimeStat('safeRemoveChild.fail.parent_mismatch');
+            warn(`[safeRemoveChild:${context}] child is not attached to parent.`);
+            if (readRuntimeFlag(RUNTIME_FLAG_KEYS.strictErrors)) {
+                throw new TypeError(`[safeRemoveChild:${context}] child is not attached to parent.`);
+            }
+            return false;
+        }
+        parent.removeChild(child);
+        incRuntimeStat('safeRemoveChild.success');
+        return true;
+    }
+    function safeInsertBefore(parent, child, anchor, context = 'unknown') {
+        incRuntimeStat('safeInsertBefore.call');
+        if (!parent || !child) {
+            incRuntimeStat('safeInsertBefore.fail.missing_node');
+            warn(`[safeInsertBefore:${context}] parent or child is missing.`);
+            if (readRuntimeFlag(RUNTIME_FLAG_KEYS.strictErrors)) {
+                throw new TypeError(`[safeInsertBefore:${context}] parent or child is missing.`);
+            }
+            return false;
+        }
+        const safeAnchor = anchor && anchor.parentNode === parent ? anchor : null;
+        if (anchor && safeAnchor === null) {
+            incRuntimeStat('safeInsertBefore.anchor_mismatch');
+        }
+        parent.insertBefore(child, safeAnchor);
+        incRuntimeStat('safeInsertBefore.success');
+        return true;
+    }
+    function getLifecycleTargetName(target) {
+        if (!target)
+            return 'unknown';
+        if (typeof target === 'function')
+            return target.name || 'anonymous-fn';
+        if (target.tag && typeof target.tag === 'function')
+            return target.tag.name || 'anonymous-component';
+        if (target.tag && typeof target.tag === 'string')
+            return target.tag;
+        return 'unknown-target';
+    }
+    function debugLifecycle(message, payload) {
+        if (!readRuntimeFlag(RUNTIME_FLAG_KEYS.debugLifecycle))
+            return;
+        // eslint-disable-next-line no-console
+        console.log(`[Mettle.js lifecycle] ${message}`, payload);
+    }
+    function setStyleProp(el, nextStyle, prevStyle = null) {
+        if (!isObject(nextStyle))
+            return;
+        const style = el.style;
+        if (isObject(prevStyle)) {
+            const prevKeys = Object.keys(prevStyle);
+            for (let i = 0; i < prevKeys.length; i++) {
+                const key = prevKeys[i];
+                if (!hasOwn(nextStyle, key)) {
+                    style[key] = '';
+                }
+            }
+        }
+        const nextKeys = Object.keys(nextStyle);
+        for (let i = 0; i < nextKeys.length; i++) {
+            const key = nextKeys[i];
+            const nextValue = nextStyle[key];
+            if (!isObject(prevStyle) || prevStyle[key] !== nextValue) {
+                style[key] = nextValue;
+            }
+        }
     }
     function addEventListener(el, name, listener) {
         if (typeof listener !== 'function')
@@ -757,6 +948,22 @@
         'hidden',
     ]);
     function setAttribute(el, key, value) {
+        if (key === 'value') {
+            // Keep input/textarea/select in sync with reactive state.
+            const normalized = value == null ? '' : value;
+            if (el.value !== normalized) {
+                el.value = normalized;
+            }
+            el.setAttribute(key, normalized);
+            return;
+        }
+        if (key === 'checked' || key === 'selected' || key === 'disabled' || key === 'readonly') {
+            const boolValue = !!value;
+            const propKey = key === 'readonly' ? 'readOnly' : key;
+            el[propKey] = boolValue;
+            boolValue ? el.setAttribute(key, '') : el.removeAttribute(key);
+            return;
+        }
         if (BOOLEAN_ATTRS.has(key)) {
             value ? el.setAttribute(key, '') : el.removeAttribute(key);
             return;
@@ -768,6 +975,13 @@
         el.setAttribute(key, value);
     }
     function removeAttribute(el, key) {
+        if (key === 'value') {
+            el.value = '';
+        }
+        if (key === 'checked' || key === 'selected' || key === 'disabled' || key === 'readonly') {
+            const propKey = key === 'readonly' ? 'readOnly' : key;
+            el[propKey] = false;
+        }
         if (key.startsWith('xlink:')) {
             el.removeAttributeNS(XLINK_NS, key);
             return;
@@ -848,7 +1062,7 @@
         }
     }
     // version
-    const version = '1.7.6';
+    const version = '1.8.0';
     // Flag
     const isFlag = /* @__PURE__ */ makeMap('$ref,$once,$memo');
     // Component
@@ -857,9 +1071,149 @@
     const domInfo = new WeakMap();
     // Memo
     let memoMap = new WeakMap();
+    // Component effect disposer (target -> dispose fn)
+    const effectDisposerMap = new WeakMap();
+    // Lifecycle (target-scoped with fallback queues)
+    const mountedHookMap = new WeakMap();
+    const unMountedHookMap = new WeakMap();
+    const activeLifecycleTargets = new Set();
+    let mountHook = [];
+    let unMountedHook = [];
+    let lifecycleTargetContext = null;
     // Update text node
     function updateTextNode(val, el) {
         el.textContent = val;
+    }
+    function withLifecycleTarget(target, fn) {
+        const prev = lifecycleTargetContext;
+        lifecycleTargetContext = target;
+        try {
+            return fn();
+        }
+        finally {
+            lifecycleTargetContext = prev;
+        }
+    }
+    function bindEffectDisposer(target, dispose) {
+        if (!target || typeof dispose !== 'function')
+            return;
+        const oldDispose = effectDisposerMap.get(target);
+        if (typeof oldDispose === 'function' && oldDispose !== dispose) {
+            oldDispose();
+        }
+        effectDisposerMap.set(target, dispose);
+    }
+    function disposeTargetEffect(target) {
+        if (!target)
+            return;
+        const dispose = effectDisposerMap.get(target);
+        if (typeof dispose === 'function') {
+            dispose();
+        }
+        effectDisposerMap.delete(target);
+    }
+    function aliasComponentRuntimeState(oldTarget, newTarget) {
+        if (!oldTarget || !newTarget || oldTarget === newTarget)
+            return;
+        const renderedTree = componentMap.get(oldTarget);
+        if (renderedTree) {
+            componentMap.set(newTarget, renderedTree);
+        }
+        const dispose = effectDisposerMap.get(oldTarget);
+        if (typeof dispose === 'function') {
+            effectDisposerMap.set(newTarget, dispose);
+        }
+        const mountedHooks = mountedHookMap.get(oldTarget);
+        if (mountedHooks && mountedHooks.length > 0) {
+            mountedHookMap.set(newTarget, mountedHooks);
+        }
+        const unmountedHooks = unMountedHookMap.get(oldTarget);
+        if (unmountedHooks && unmountedHooks.length > 0) {
+            unMountedHookMap.set(newTarget, unmountedHooks);
+        }
+    }
+    function pushLifecycleHook(map, target, fn) {
+        const list = map.get(target);
+        if (list) {
+            list.push(fn);
+        }
+        else {
+            map.set(target, [fn]);
+        }
+    }
+    function bindMounted(target = null) {
+        if (target !== null && target !== undefined) {
+            const hooks = mountedHookMap.get(target);
+            if (hooks && hooks.length > 0) {
+                debugLifecycle('run mounted hooks', {
+                    target: getLifecycleTargetName(target),
+                    count: hooks.length,
+                });
+                for (let i = 0, j = hooks.length; i < j; i++) {
+                    hooks[i] && hooks[i]();
+                }
+                mountedHookMap.delete(target);
+            }
+            activeLifecycleTargets.add(target);
+        }
+        if (mountHook.length > 0) {
+            for (let i = 0, j = mountHook.length; i < j; i++) {
+                mountHook[i] && mountHook[i]();
+            }
+            mountHook = [];
+        }
+    }
+    function bindUnmounted(target = null) {
+        if (target !== null && target !== undefined) {
+            disposeTargetEffect(target);
+            const hooks = unMountedHookMap.get(target);
+            if (hooks && hooks.length > 0) {
+                debugLifecycle('run unmounted hooks', {
+                    target: getLifecycleTargetName(target),
+                    count: hooks.length,
+                });
+                for (let i = 0, j = hooks.length; i < j; i++) {
+                    hooks[i] && hooks[i]();
+                }
+                unMountedHookMap.delete(target);
+            }
+            activeLifecycleTargets.delete(target);
+            return;
+        }
+        const targets = Array.from(activeLifecycleTargets);
+        for (let i = 0; i < targets.length; i++) {
+            bindUnmounted(targets[i]);
+        }
+        if (unMountedHook.length > 0) {
+            for (let i = 0, j = unMountedHook.length; i < j; i++) {
+                unMountedHook[i] && unMountedHook[i]();
+            }
+            unMountedHook = [];
+        }
+    }
+    function traverseUnmount(vnode) {
+        if (!isVnode(vnode))
+            return;
+        if (typeof vnode.tag === 'function') {
+            debugLifecycle('traverse component unmount', {
+                target: getLifecycleTargetName(vnode),
+            });
+            const renderedTree = componentMap.get(vnode);
+            bindUnmounted(vnode);
+            if (renderedTree) {
+                traverseUnmount(renderedTree);
+            }
+            return;
+        }
+        const children = vnode.children;
+        if (Array.isArray(children)) {
+            for (let i = 0; i < children.length; i++) {
+                traverseUnmount(children[i]);
+            }
+        }
+        else if (isVnode(children)) {
+            traverseUnmount(children);
+        }
     }
     // Convert virtual dom to real dom
     function mount(vnode, container, anchor) {
@@ -925,10 +1279,14 @@
             }
         }
         else if (typeof tag === 'function') {
-            const template = tag.call(tag, props, tag, memo.bind(tag));
-            const newTree = effectFn(template, tag);
-            componentMap.set(tag, newTree);
-            mount(newTree, container);
+            const template = withLifecycleTarget(vnode, () => tag.call(tag, props, tag, memo.bind(vnode)));
+            const newTree = effectFn(template, vnode);
+            componentMap.set(vnode, newTree);
+            const childEl = mount(newTree, container, anchor);
+            // Ensure component vnodes also expose a stable DOM anchor for keyed diff.
+            vnode.el = newTree?.el || childEl;
+            bindMounted(vnode);
+            return vnode.el;
         }
     }
     // Diff
@@ -939,12 +1297,52 @@
             return;
         }
         if (!notTagComponent(oNode, nNode)) {
+            // Keep component vnode DOM anchor across tree replacement.
+            nNode.el = oNode.el;
+            const parent = oNode.el?.parentNode;
+            const anchor = oNode.el?.nextSibling;
+            const sameComponent = checkSameVnode(oNode, nNode);
+            const changedProps = hasChangedProps(oNode.props || {}, nNode.props || {});
+            if (!sameComponent || changedProps) {
+                if (sameComponent && shouldUseComponentPatchFirst()) {
+                    try {
+                        const oldRenderedTree = componentMap.get(oNode);
+                        if (oldRenderedTree && typeof oNode.tag === 'function') {
+                            const nextTemplate = withLifecycleTarget(oNode, () => oNode.tag.call(oNode.tag, nNode.props, oNode.tag, memo.bind(oNode)));
+                            const nextRenderedTree = nextTemplate();
+                            patch(oldRenderedTree, nextRenderedTree, memoFlag);
+                            componentMap.set(oNode, nextRenderedTree);
+                            aliasComponentRuntimeState(oNode, nNode);
+                            nNode.el = nextRenderedTree.el || oNode.el;
+                            debugLifecycle('component patch-first path', {
+                                target: getLifecycleTargetName(oNode),
+                            });
+                            return;
+                        }
+                    }
+                    catch (err) {
+                        warn(err);
+                        debugLifecycle('component patch-first fallback remount', {
+                            target: getLifecycleTargetName(oNode),
+                        });
+                    }
+                }
+                if (parent && oNode.el) {
+                    traverseUnmount(oNode);
+                    safeRemoveChild(parent, oNode.el, 'patch-component-remount');
+                    mount(nNode, parent, anchor);
+                }
+                return;
+            }
+            // Same component and props unchanged: keep runtime state addressable by new vnode.
+            aliasComponentRuntimeState(oNode, nNode);
             return;
         }
         if (!checkSameVnode(oNode, nNode)) {
             const parent = oNode.el.parentNode;
             const anchor = oNode.el.nextSibling;
-            parent.removeChild(oNode.el);
+            traverseUnmount(oNode);
+            safeRemoveChild(parent, oNode.el, 'patch-replace-node');
             mount(nNode, parent, anchor);
         }
         else {
@@ -952,24 +1350,18 @@
             // props
             const oldProps = oNode.props || {};
             const newProps = nNode.props || {};
-            const allKeys = {};
             const newKeys = Object.keys(newProps);
             const oldKeys = Object.keys(oldProps);
-            const newKeySet = new Set(newKeys);
-            for (let i = 0; i < newKeys.length; i++) {
-                allKeys[newKeys[i]] = true;
-            }
-            for (let i = 0; i < oldKeys.length; i++) {
-                allKeys[oldKeys[i]] = true;
-            }
-            const keys = Object.keys(allKeys);
-            for (let index = 0; index < keys.length; index++) {
-                const key = keys[index];
+            for (let index = 0; index < newKeys.length; index++) {
+                const key = newKeys[index];
                 const newValue = newProps[key];
                 const oldValue = oldProps[key];
                 if (newValue === oldValue)
                     continue;
                 if (isUndef(newValue)) {
+                    if (typeof oldValue === 'function' && key.startsWith('on')) {
+                        removeEventListener(el, key, oldValue);
+                    }
                     removeAttribute(el, key);
                     continue;
                 }
@@ -977,14 +1369,16 @@
                 const isFunc = typeof newValue === 'function';
                 const isStyle = key === 'style';
                 if (isFunc) {
-                    if (newValue.toString() !== oldValue.toString()) {
+                    // Event handlers should be compared by reference.
+                    // toString()-based comparison may treat different closures as equal.
+                    if (newValue !== oldValue) {
                         removeEventListener(el, key, oldValue);
                         addEventListener(el, key, newValue);
                     }
                     continue;
                 }
                 if (isStyle && newObjType) {
-                    setStyleProp(el, newValue);
+                    setStyleProp(el, newValue, isObject(oldValue) ? oldValue : null);
                     continue;
                 }
                 const isRegularAttr = key !== 'key' && !isFlag(key);
@@ -994,7 +1388,12 @@
             }
             for (let index = 0; index < oldKeys.length; index++) {
                 const key = oldKeys[index];
-                if (!newKeySet.has(key)) {
+                if (!hasOwn(newProps, key)) {
+                    const oldValue = oldProps[key];
+                    if (typeof oldValue === 'function' && key.startsWith('on')) {
+                        removeEventListener(el, key, oldValue);
+                        continue;
+                    }
                     removeAttribute(el, key);
                 }
             }
@@ -1050,14 +1449,15 @@
                 const nextPos = e2 + 1;
                 const anchor = nextPos < l2 ? n2[nextPos].el : null;
                 while (i <= e2) {
-                    parentElm.insertBefore(mount(n2[i]), anchor);
+                    safeInsertBefore(parentElm, mount(n2[i]), anchor, 'patchKeyChildren-append');
                     i++;
                 }
             }
         }
         else if (i > e2) {
             while (i <= e1) {
-                parentElm.removeChild(n1[i].el);
+                traverseUnmount(n1[i]);
+                safeRemoveChild(parentElm, n1[i].el, 'patchKeyChildren-trim-tail');
                 i++;
             }
         }
@@ -1081,11 +1481,12 @@
                 newIndexToOldIndexMap[i] = 0;
             for (let i = s1; i <= e1; i++) {
                 if (patched >= toBePatched) {
-                    parentElm.removeChild(n1[i].el);
+                    traverseUnmount(n1[i]);
+                    safeRemoveChild(parentElm, n1[i].el, 'patchKeyChildren-overpatched');
                     continue;
                 }
                 let newIndex;
-                if (n1[i].key !== null) {
+                if (n1[i].key != null) {
                     newIndex = keyToNewIndexMap.get(n1[i].key);
                 }
                 else {
@@ -1097,7 +1498,8 @@
                     }
                 }
                 if (newIndex === undefined) {
-                    parentElm.removeChild(n1[i].el);
+                    traverseUnmount(n1[i]);
+                    safeRemoveChild(parentElm, n1[i].el, 'patchKeyChildren-remove-missing');
                 }
                 else {
                     newIndexToOldIndexMap[newIndex - s2] = i + 1;
@@ -1117,11 +1519,11 @@
                 const nextIndex = i + s2;
                 const anchor = nextIndex + 1 < l2 ? n2[nextIndex + 1].el : null;
                 if (newIndexToOldIndexMap[i] === 0) {
-                    parentElm.insertBefore(mount(n2[nextIndex]), anchor);
+                    safeInsertBefore(parentElm, mount(n2[nextIndex]), anchor, 'patchKeyChildren-insert-new');
                 }
                 else if (moved) {
                     if (j < 0 || i !== increasingNewIndexSequence[j]) {
-                        parentElm.insertBefore(n2[nextIndex].el, anchor);
+                        safeInsertBefore(parentElm, n2[nextIndex].el, anchor, 'patchKeyChildren-move');
                     }
                     else {
                         j--;
@@ -1139,6 +1541,9 @@
         }
         catch (err) {
             warn(err);
+            if (readRuntimeFlag(RUNTIME_FLAG_KEYS.strictErrors)) {
+                throw err;
+            }
         }
     }
     // Memo
@@ -1150,22 +1555,26 @@
     }
     // Effect
     function effectFn(template, target) {
-        let initMode = true;
-        effect(() => {
+        let currentTree;
+        let initialized = false;
+        const dispose = effect(() => {
             target.template = template;
-            const newTree = template();
-            if (initMode) {
-                initMode = null;
+            const newTree = withLifecycleTarget(target, () => template());
+            if (!initialized) {
+                initialized = true;
+                currentTree = newTree;
             }
             else {
                 const memoFlag = memoMap.get(target);
                 setData(target, newTree, memoFlag);
                 if (memoMap.has(target)) {
-                    memoMap = new WeakMap();
+                    memoMap.delete(target);
                 }
+                currentTree = newTree;
             }
         });
-        return template();
+        bindEffectDisposer(target, dispose);
+        return currentTree;
     }
     // Normalize Container
     function normalizeContainer(container) {
@@ -1206,18 +1615,15 @@
     // Create Mettle application
     function createApp(root, container) {
         const rootContent = root.tag;
-        const template = rootContent.call(rootContent, root.props, rootContent, memo.bind(rootContent));
-        const newTree = effectFn(template, rootContent);
+        const template = withLifecycleTarget(root, () => rootContent.call(rootContent, root.props, rootContent, memo.bind(root)));
+        const newTree = effectFn(template, root);
         const mountNodeEl = normalizeContainer(container);
         mount(newTree, mountNodeEl);
-        componentMap.set(rootContent, newTree);
+        componentMap.set(root, newTree);
         _el = mountNodeEl;
-        bindMounted();
+        bindMounted(root);
     }
     // onMounted
-    let mountHook = [];
-    let unMountedHookCount = 0;
-    let oldunMountedHookCount = 0;
     function onMounted(fn = null) {
         if (fn === null)
             return;
@@ -1225,20 +1631,18 @@
             warn('The parameter of onMounted is not a function!');
             return;
         }
-        mountHook.push(fn);
-    }
-    function bindMounted() {
-        if (mountHook.length > 0) {
-            for (let i = 0, j = mountHook.length; i < j; i++) {
-                mountHook[i] && mountHook[i]();
-            }
+        if (lifecycleTargetContext !== null && lifecycleTargetContext !== undefined) {
+            debugLifecycle('register mounted hook', {
+                target: getLifecycleTargetName(lifecycleTargetContext),
+            });
+            pushLifecycleHook(mountedHookMap, lifecycleTargetContext, fn);
         }
-        oldunMountedHookCount = unMountedHookCount;
-        unMountedHookCount = 0;
-        mountHook = [];
+        else {
+            debugLifecycle('register mounted hook (fallback queue)', {});
+            mountHook.push(fn);
+        }
     }
     // onUnmounted
-    let unMountedHook = [];
     function onUnmounted(fn = null) {
         if (fn === null)
             return;
@@ -1246,648 +1650,43 @@
             warn('The parameter of onUnmounted is not a function!');
             return;
         }
-        unMountedHookCount += 1;
-        unMountedHook.push(fn);
-    }
-    function bindUnmounted() {
-        if (unMountedHook.length > 0) {
-            for (let i = 0; i < oldunMountedHookCount; i++) {
-                unMountedHook[i] && unMountedHook[i]();
-            }
-            unMountedHook.splice(0, oldunMountedHookCount);
+        if (lifecycleTargetContext !== null && lifecycleTargetContext !== undefined) {
+            debugLifecycle('register unmounted hook', {
+                target: getLifecycleTargetName(lifecycleTargetContext),
+            });
+            pushLifecycleHook(unMountedHookMap, lifecycleTargetContext, fn);
         }
-        oldunMountedHookCount = unMountedHookCount;
+        else {
+            debugLifecycle('register unmounted hook (fallback queue)', {});
+            unMountedHook.push(fn);
+        }
     }
     // Reset view
     function resetView(view, routerContainer) {
         bindUnmounted();
         const routerContainerEl = routerContainer ? normalizeContainer(routerContainer) : _el;
         routerContainerEl.innerHTML = '';
-        const template = view.call(view, view, memo.bind(view));
+        const template = withLifecycleTarget(view, () => view.call(view, view, memo.bind(view)));
         const newTree = effectFn(template, view);
         mount(newTree, routerContainerEl);
         componentMap.set(view, newTree);
-        bindMounted();
+        bindMounted(view);
     }
-
-    var NOTHING = Symbol.for('immer-nothing');
-    var DRAFTABLE = Symbol.for('immer-draftable');
-    var DRAFT_STATE = Symbol.for('immer-state');
-    function die(error, ...args) {
-        throw new Error(`Error`);
-    }
-    var getPrototypeOf = Object.getPrototypeOf;
-    function isDraft(value) {
-        return !!value && !!value[DRAFT_STATE];
-    }
-    function isDraftable(value) {
-        if (!value)
-            return false;
-        return (isPlainObject(value) ||
-            Array.isArray(value) ||
-            !!value[DRAFTABLE] ||
-            !!value.constructor?.[DRAFTABLE] ||
-            isMap(value) ||
-            isSet(value));
-    }
-    var objectCtorString = Object.prototype.constructor.toString();
-    function isPlainObject(value) {
-        if (!value || typeof value !== 'object')
-            return false;
-        const proto = getPrototypeOf(value);
-        if (proto === null) {
-            return true;
-        }
-        const Ctor = Object.hasOwnProperty.call(proto, 'constructor') && proto.constructor;
-        if (Ctor === Object)
-            return true;
-        return typeof Ctor == 'function' && Function.toString.call(Ctor) === objectCtorString;
-    }
-    function each(obj, iter) {
-        if (getArchtype(obj) === 0 /* Object */) {
-            Reflect.ownKeys(obj).forEach((key) => {
-                iter(key, obj[key], obj);
-            });
-        }
-        else {
-            obj.forEach((entry, index) => iter(index, entry, obj));
-        }
-    }
-    function getArchtype(thing) {
-        const state = thing[DRAFT_STATE];
-        return state
-            ? state.type_
-            : Array.isArray(thing)
-                ? 1 /* Array */
-                : isMap(thing)
-                    ? 2 /* Map */
-                    : isSet(thing)
-                        ? 3 /* Set */
-                        : 0 /* Object */;
-    }
-    function has(thing, prop) {
-        return getArchtype(thing) === 2 /* Map */
-            ? thing.has(prop)
-            : Object.prototype.hasOwnProperty.call(thing, prop);
-    }
-    function set(thing, propOrOldValue, value) {
-        const t = getArchtype(thing);
-        if (t === 2 /* Map */)
-            thing.set(propOrOldValue, value);
-        else if (t === 3 /* Set */) {
-            thing.add(value);
-        }
-        else
-            thing[propOrOldValue] = value;
-    }
-    function is(x, y) {
-        if (x === y) {
-            return x !== 0 || 1 / x === 1 / y;
-        }
-        else {
-            return x !== x && y !== y;
-        }
-    }
-    function isMap(target) {
-        return target instanceof Map;
-    }
-    function isSet(target) {
-        return target instanceof Set;
-    }
-    function latest(state) {
-        return state.copy_ || state.base_;
-    }
-    function shallowCopy(base, strict) {
-        if (isMap(base)) {
-            return new Map(base);
-        }
-        if (isSet(base)) {
-            return new Set(base);
-        }
-        if (Array.isArray(base))
-            return Array.prototype.slice.call(base);
-        const isPlain = isPlainObject(base);
-        if (strict === true || (strict === 'class_only' && !isPlain)) {
-            const descriptors = Object.getOwnPropertyDescriptors(base);
-            delete descriptors[DRAFT_STATE];
-            let keys = Reflect.ownKeys(descriptors);
-            for (let i = 0; i < keys.length; i++) {
-                const key = keys[i];
-                const desc = descriptors[key];
-                if (desc.writable === false) {
-                    desc.writable = true;
-                    desc.configurable = true;
-                }
-                if (desc.get || desc.set)
-                    descriptors[key] = {
-                        configurable: true,
-                        writable: true,
-                        enumerable: desc.enumerable,
-                        value: base[key],
-                    };
-            }
-            return Object.create(getPrototypeOf(base), descriptors);
-        }
-        else {
-            const proto = getPrototypeOf(base);
-            if (proto !== null && isPlain) {
-                return { ...base };
-            }
-            const obj = Object.create(proto);
-            return Object.assign(obj, base);
-        }
-    }
-    function freeze(obj, deep = false) {
-        if (isFrozen(obj) || isDraft(obj) || !isDraftable(obj))
-            return obj;
-        if (getArchtype(obj) > 1) {
-            obj.set = obj.add = obj.clear = obj.delete = dontMutateFrozenCollections;
-        }
-        Object.freeze(obj);
-        if (deep)
-            Object.entries(obj).forEach(([key, value]) => freeze(value, true));
-        return obj;
-    }
-    function dontMutateFrozenCollections() {
-        die();
-    }
-    function isFrozen(obj) {
-        return Object.isFrozen(obj);
-    }
-    var plugins = {};
-    function getPlugin(pluginKey) {
-        const plugin = plugins[pluginKey];
-        if (!plugin) {
-            die(0, pluginKey);
-        }
-        return plugin;
-    }
-    var currentScope;
-    function getCurrentScope() {
-        return currentScope;
-    }
-    function createScope(parent_, immer_) {
-        return {
-            drafts_: [],
-            parent_,
-            immer_,
-            canAutoFreeze_: true,
-            unfinalizedDrafts_: 0,
-        };
-    }
-    function usePatchesInScope(scope, patchListener) {
-        if (patchListener) {
-            getPlugin('Patches');
-            scope.patches_ = [];
-            scope.inversePatches_ = [];
-            scope.patchListener_ = patchListener;
-        }
-    }
-    function revokeScope(scope) {
-        leaveScope(scope);
-        scope.drafts_.forEach(revokeDraft);
-        scope.drafts_ = null;
-    }
-    function leaveScope(scope) {
-        if (scope === currentScope) {
-            currentScope = scope.parent_;
-        }
-    }
-    function enterScope(immer2) {
-        return (currentScope = createScope(currentScope, immer2));
-    }
-    function revokeDraft(draft) {
-        const state = draft[DRAFT_STATE];
-        if (state.type_ === 0 /* Object */ || state.type_ === 1 /* Array */)
-            state.revoke_();
-        else
-            state.revoked_ = true;
-    }
-    function processResult(result, scope) {
-        scope.unfinalizedDrafts_ = scope.drafts_.length;
-        const baseDraft = scope.drafts_[0];
-        const isReplaced = result !== void 0 && result !== baseDraft;
-        if (isReplaced) {
-            if (baseDraft[DRAFT_STATE].modified_) {
-                revokeScope(scope);
-                die();
-            }
-            if (isDraftable(result)) {
-                result = finalize(scope, result);
-                if (!scope.parent_)
-                    maybeFreeze(scope, result);
-            }
-            if (scope.patches_) {
-                getPlugin('Patches').generateReplacementPatches_(baseDraft[DRAFT_STATE].base_, result, scope.patches_, scope.inversePatches_);
-            }
-        }
-        else {
-            result = finalize(scope, baseDraft, []);
-        }
-        revokeScope(scope);
-        if (scope.patches_) {
-            scope.patchListener_(scope.patches_, scope.inversePatches_);
-        }
-        return result !== NOTHING ? result : void 0;
-    }
-    function finalize(rootScope, value, path) {
-        if (isFrozen(value))
-            return value;
-        const state = value[DRAFT_STATE];
-        if (!state) {
-            each(value, (key, childValue) => finalizeProperty(rootScope, state, value, key, childValue, path));
-            return value;
-        }
-        if (state.scope_ !== rootScope)
-            return value;
-        if (!state.modified_) {
-            maybeFreeze(rootScope, state.base_, true);
-            return state.base_;
-        }
-        if (!state.finalized_) {
-            state.finalized_ = true;
-            state.scope_.unfinalizedDrafts_--;
-            const result = state.copy_;
-            let resultEach = result;
-            let isSet2 = false;
-            if (state.type_ === 3 /* Set */) {
-                resultEach = new Set(result);
-                result.clear();
-                isSet2 = true;
-            }
-            each(resultEach, (key, childValue) => finalizeProperty(rootScope, state, result, key, childValue, path, isSet2));
-            maybeFreeze(rootScope, result, false);
-            if (path && rootScope.patches_) {
-                getPlugin('Patches').generatePatches_(state, path, rootScope.patches_, rootScope.inversePatches_);
-            }
-        }
-        return state.copy_;
-    }
-    function finalizeProperty(rootScope, parentState, targetObject, prop, childValue, rootPath, targetIsSet) {
-        if (isDraft(childValue)) {
-            const path = rootPath &&
-                parentState &&
-                parentState.type_ !== 3 /* Set */ && // Set objects are atomic since they have no keys.
-                !has(parentState.assigned_, prop)
-                ? rootPath.concat(prop)
-                : void 0;
-            const res = finalize(rootScope, childValue, path);
-            set(targetObject, prop, res);
-            if (isDraft(res)) {
-                rootScope.canAutoFreeze_ = false;
-            }
-            else
-                return;
-        }
-        else if (targetIsSet) {
-            targetObject.add(childValue);
-        }
-        if (isDraftable(childValue) && !isFrozen(childValue)) {
-            if (!rootScope.immer_.autoFreeze_ && rootScope.unfinalizedDrafts_ < 1) {
-                return;
-            }
-            finalize(rootScope, childValue);
-            if ((!parentState || !parentState.scope_.parent_) &&
-                typeof prop !== 'symbol' &&
-                Object.prototype.propertyIsEnumerable.call(targetObject, prop))
-                maybeFreeze(rootScope, childValue);
-        }
-    }
-    function maybeFreeze(scope, value, deep = false) {
-        if (!scope.parent_ && scope.immer_.autoFreeze_ && scope.canAutoFreeze_) {
-            freeze(value, deep);
-        }
-    }
-    function createProxyProxy(base, parent) {
-        const isArray = Array.isArray(base);
-        const state = {
-            type_: isArray ? 1 /* Array */ : 0 /* Object */,
-            scope_: parent ? parent.scope_ : getCurrentScope(),
-            modified_: false,
-            finalized_: false,
-            assigned_: {},
-            parent_: parent,
-            base_: base,
-            draft_: null,
-            copy_: null,
-            revoke_: null,
-            isManual_: false,
-        };
-        let target = state;
-        let traps = objectTraps;
-        if (isArray) {
-            target = [state];
-            traps = arrayTraps;
-        }
-        const { revoke, proxy } = Proxy.revocable(target, traps);
-        state.draft_ = proxy;
-        state.revoke_ = revoke;
-        return proxy;
-    }
-    var objectTraps = {
-        get(state, prop) {
-            if (prop === DRAFT_STATE)
-                return state;
-            const source = latest(state);
-            if (!has(source, prop)) {
-                return readPropFromProto(state, source, prop);
-            }
-            const value = source[prop];
-            if (state.finalized_ || !isDraftable(value)) {
-                return value;
-            }
-            if (value === peek(state.base_, prop)) {
-                prepareCopy(state);
-                return (state.copy_[prop] = createProxy(value, state));
-            }
-            return value;
-        },
-        has(state, prop) {
-            return prop in latest(state);
-        },
-        ownKeys(state) {
-            return Reflect.ownKeys(latest(state));
-        },
-        set(state, prop, value) {
-            const desc = getDescriptorFromProto(latest(state), prop);
-            if (desc?.set) {
-                desc.set.call(state.draft_, value);
-                return true;
-            }
-            if (!state.modified_) {
-                const current2 = peek(latest(state), prop);
-                const currentState = current2?.[DRAFT_STATE];
-                if (currentState && currentState.base_ === value) {
-                    state.copy_[prop] = value;
-                    state.assigned_[prop] = false;
-                    return true;
-                }
-                if (is(value, current2) && (value !== void 0 || has(state.base_, prop)))
-                    return true;
-                prepareCopy(state);
-                markChanged(state);
-            }
-            if ((state.copy_[prop] === value && // special case: handle new props with value 'undefined'
-                (value !== void 0 || prop in state.copy_)) || // special case: NaN
-                (Number.isNaN(value) && Number.isNaN(state.copy_[prop])))
-                return true;
-            state.copy_[prop] = value;
-            state.assigned_[prop] = true;
-            return true;
-        },
-        deleteProperty(state, prop) {
-            if (peek(state.base_, prop) !== void 0 || prop in state.base_) {
-                state.assigned_[prop] = false;
-                prepareCopy(state);
-                markChanged(state);
-            }
-            else {
-                delete state.assigned_[prop];
-            }
-            if (state.copy_) {
-                delete state.copy_[prop];
-            }
-            return true;
-        },
-        getOwnPropertyDescriptor(state, prop) {
-            const owner = latest(state);
-            const desc = Reflect.getOwnPropertyDescriptor(owner, prop);
-            if (!desc)
-                return desc;
-            return {
-                writable: true,
-                configurable: state.type_ !== 1 /* Array */ || prop !== 'length',
-                enumerable: desc.enumerable,
-                value: owner[prop],
-            };
-        },
-        defineProperty() {
-            die();
-        },
-        getPrototypeOf(state) {
-            return getPrototypeOf(state.base_);
-        },
-        setPrototypeOf() {
-            die();
-        },
-    };
-    var arrayTraps = {};
-    each(objectTraps, (key, fn) => {
-        arrayTraps[key] = function () {
-            arguments[0] = arguments[0][0];
-            return fn.apply(this, arguments);
-        };
-    });
-    arrayTraps.deleteProperty = function (state, prop) {
-        return arrayTraps.set.call(this, state, prop, void 0);
-    };
-    arrayTraps.set = function (state, prop, value) {
-        // @ts-ignore
-        return objectTraps.set.call(this, state[0], prop, value, state[0]);
-    };
-    function peek(draft, prop) {
-        const state = draft[DRAFT_STATE];
-        const source = state ? latest(state) : draft;
-        return source[prop];
-    }
-    function readPropFromProto(state, source, prop) {
-        const desc = getDescriptorFromProto(source, prop);
-        return desc ? (`value` in desc ? desc.value : desc.get?.call(state.draft_)) : void 0;
-    }
-    function getDescriptorFromProto(source, prop) {
-        if (!(prop in source))
-            return void 0;
-        let proto = getPrototypeOf(source);
-        while (proto) {
-            const desc = Object.getOwnPropertyDescriptor(proto, prop);
-            if (desc)
-                return desc;
-            proto = getPrototypeOf(proto);
-        }
-        return void 0;
-    }
-    function markChanged(state) {
-        if (!state.modified_) {
-            state.modified_ = true;
-            if (state.parent_) {
-                markChanged(state.parent_);
-            }
-        }
-    }
-    function prepareCopy(state) {
-        if (!state.copy_) {
-            state.copy_ = shallowCopy(state.base_, state.scope_.immer_.useStrictShallowCopy_);
-        }
-    }
-    var Immer2 = class {
-        autoFreeze_;
-        useStrictShallowCopy_;
-        produce;
-        produceWithPatches;
-        constructor(config) {
-            this.autoFreeze_ = true;
-            this.useStrictShallowCopy_ = false;
-            this.produce = (base, recipe, patchListener) => {
-                if (typeof base === 'function' && typeof recipe !== 'function') {
-                    const defaultBase = recipe;
-                    recipe = base;
-                    const self = this;
-                    return function curriedProduce(base2 = defaultBase, ...args) {
-                        return self.produce(base2, (draft) => recipe.call(this, draft, ...args));
-                    };
-                }
-                if (typeof recipe !== 'function')
-                    die();
-                if (patchListener !== void 0 && typeof patchListener !== 'function')
-                    die();
-                let result;
-                if (isDraftable(base)) {
-                    const scope = enterScope(this);
-                    const proxy = createProxy(base, void 0);
-                    let hasError = true;
-                    try {
-                        result = recipe(proxy);
-                        hasError = false;
-                    }
-                    finally {
-                        if (hasError)
-                            revokeScope(scope);
-                        else
-                            leaveScope(scope);
-                    }
-                    usePatchesInScope(scope, patchListener);
-                    return processResult(result, scope);
-                }
-                else if (!base || typeof base !== 'object') {
-                    result = recipe(base);
-                    if (result === void 0)
-                        result = base;
-                    if (result === NOTHING)
-                        result = void 0;
-                    if (this.autoFreeze_)
-                        freeze(result, true);
-                    if (patchListener) {
-                        const p = [];
-                        const ip = [];
-                        getPlugin('Patches').generateReplacementPatches_(base, result, p, ip);
-                        patchListener(p, ip);
-                    }
-                    return result;
-                }
-                else
-                    die(1, base);
-            };
-            this.produceWithPatches = (base, recipe) => {
-                if (typeof base === 'function') {
-                    return (state, ...args) => this.produceWithPatches(state, (draft) => base(draft, ...args));
-                }
-                let patches, inversePatches;
-                const result = this.produce(base, recipe, (p, ip) => {
-                    patches = p;
-                    inversePatches = ip;
-                });
-                return [result, patches, inversePatches];
-            };
-            if (typeof config?.autoFreeze === 'boolean')
-                this.setAutoFreeze(config.autoFreeze);
-            if (typeof config?.useStrictShallowCopy === 'boolean')
-                this.setUseStrictShallowCopy(config.useStrictShallowCopy);
-        }
-        createDraft(base) {
-            if (!isDraftable(base))
-                die();
-            if (isDraft(base))
-                base = current(base);
-            const scope = enterScope(this);
-            const proxy = createProxy(base, void 0);
-            proxy[DRAFT_STATE].isManual_ = true;
-            leaveScope(scope);
-            return proxy;
-        }
-        finishDraft(draft, patchListener) {
-            const state = draft && draft[DRAFT_STATE];
-            if (!state || !state.isManual_)
-                die();
-            const { scope_: scope } = state;
-            usePatchesInScope(scope, patchListener);
-            return processResult(void 0, scope);
-        }
-        setAutoFreeze(value) {
-            this.autoFreeze_ = value;
-        }
-        setUseStrictShallowCopy(value) {
-            this.useStrictShallowCopy_ = value;
-        }
-        applyPatches(base, patches) {
-            let i;
-            for (i = patches.length - 1; i >= 0; i--) {
-                const patch = patches[i];
-                if (patch.path.length === 0 && patch.op === 'replace') {
-                    base = patch.value;
-                    break;
-                }
-            }
-            if (i > -1) {
-                patches = patches.slice(i + 1);
-            }
-            const applyPatchesImpl = getPlugin('Patches').applyPatches_;
-            if (isDraft(base)) {
-                return applyPatchesImpl(base, patches);
-            }
-            return this.produce(base, (draft) => applyPatchesImpl(draft, patches));
-        }
-    };
-    function createProxy(value, parent) {
-        const draft = isMap(value)
-            ? getPlugin('MapSet').proxyMap_(value, parent)
-            : isSet(value)
-                ? getPlugin('MapSet').proxySet_(value, parent)
-                : createProxyProxy(value, parent);
-        const scope = parent ? parent.scope_ : getCurrentScope();
-        scope.drafts_.push(draft);
-        return draft;
-    }
-    function current(value) {
-        if (!isDraft(value))
-            die(10, value);
-        return currentImpl(value);
-    }
-    function currentImpl(value) {
-        if (!isDraftable(value) || isFrozen(value))
-            return value;
-        const state = value[DRAFT_STATE];
-        let copy;
-        if (state) {
-            if (!state.modified_)
-                return state.base_;
-            state.finalized_ = true;
-            copy = shallowCopy(value, state.scope_.immer_.useStrictShallowCopy_);
-        }
-        else {
-            copy = shallowCopy(value, true);
-        }
-        each(copy, (key, childValue) => {
-            set(copy, key, currentImpl(childValue));
-        });
-        if (state) {
-            state.finalized_ = false;
-        }
-        return copy;
-    }
-    var immer = new Immer2();
-    var produce = immer.produce;
 
     exports.batch = batch;
     exports.computed = computed;
     exports.createApp = createApp;
     exports.domInfo = domInfo;
     exports.effect = effect;
+    exports.getRuntimeStatsSnapshot = getRuntimeStatsSnapshot;
     exports.html = html;
     exports.onMounted = onMounted;
     exports.onUnmounted = onUnmounted;
-    exports.produce = produce;
+    exports.resetRuntimeStats = resetRuntimeStats;
     exports.resetView = resetView;
     exports.signal = signal;
+    exports.trackEffectCreated = trackEffectCreated;
+    exports.trackEffectDisposed = trackEffectDisposed;
     exports.untracked = untracked;
     exports.version = version;
 

@@ -43,6 +43,53 @@ const hasOwnProperty$1 = Object.prototype.hasOwnProperty;
 const hasOwn = (val: any, key: any) => hasOwnProperty$1.call(val, key);
 const isObject = (val: Object) => val !== null && typeof val === 'object';
 const isUndef = (v: undefined | null) => v === undefined || v === null;
+const RUNTIME_FLAG_KEYS = {
+  strictErrors: '__METTLE_STRICT_ERRORS__',
+  compareFunctionProps: '__METTLE_COMPARE_FUNCTION_PROPS__',
+  debugLifecycle: '__METTLE_DEBUG_LIFECYCLE__',
+  componentPatchFirst: '__METTLE_COMPONENT_PATCH_FIRST__',
+  debugRuntimeStats: '__METTLE_DEBUG_RUNTIME_STATS__',
+};
+function readRuntimeFlag(flagKey: string) {
+  if (typeof globalThis === 'undefined') return false;
+  return globalThis[flagKey as keyof typeof globalThis] === true;
+}
+const RUNTIME_STATS_KEY = '__METTLE_RUNTIME_STATS__';
+function getRuntimeStats() {
+  if (typeof globalThis === 'undefined') return null;
+  if (!globalThis[RUNTIME_STATS_KEY as keyof typeof globalThis]) {
+    (globalThis as any)[RUNTIME_STATS_KEY] = Object.create(null);
+  }
+  return (globalThis as any)[RUNTIME_STATS_KEY];
+}
+function incRuntimeStat(name: string, step = 1) {
+  if (!readRuntimeFlag(RUNTIME_FLAG_KEYS.debugRuntimeStats)) return;
+  const stats = getRuntimeStats();
+  if (!stats) return;
+  const current = typeof stats[name] === 'number' ? stats[name] : 0;
+  stats[name] = current + step;
+}
+function trackEffectCreated() {
+  incRuntimeStat('effect.created');
+  incRuntimeStat('effect.active', 1);
+}
+function trackEffectDisposed(effect: any) {
+  if (effect && effect._statsDisposed) return;
+  if (effect) {
+    effect._statsDisposed = true;
+  }
+  incRuntimeStat('effect.disposed');
+  incRuntimeStat('effect.active', -1);
+}
+function getRuntimeStatsSnapshot() {
+  const stats = getRuntimeStats();
+  if (!stats) return {};
+  return { ...stats };
+}
+function resetRuntimeStats() {
+  if (typeof globalThis === 'undefined') return;
+  (globalThis as any)[RUNTIME_STATS_KEY] = Object.create(null);
+}
 interface vnodeType {
   tag: any;
   key: any;
@@ -53,19 +100,143 @@ interface vnodeType {
 const checkSameVnode = (o: vnodeType, n: vnodeType) => o.tag === n.tag && o.key === n.key;
 const notTagComponent = (oNode: vnodeType, nNode: vnodeType) =>
   typeof oNode.tag !== 'function' && typeof nNode.tag !== 'function';
+
 const isVnode = (vnode: vnodeType) =>
   vnode != null && (typeof vnode === 'object' ? 'tag' in vnode : false);
 const isTextChildren = (children: any) => !isVnode(children) && !Array.isArray(children);
+const isEventPropKey = (key: string) => /^on[A-Z]/.test(key);
+const shouldCompareFunctionProps = () => readRuntimeFlag(RUNTIME_FLAG_KEYS.compareFunctionProps);
+const shouldUseComponentPatchFirst = () => {
+  if (typeof globalThis === 'undefined') return true;
+  // Default to patch-first for better update performance.
+  // Only disable when explicitly set to false.
+  return (globalThis as any)[RUNTIME_FLAG_KEYS.componentPatchFirst] !== false;
+};
+const shallowEqualObject = (a: any, b: any) => {
+  if (a === b) return true;
+  if (!isObject(a) || !isObject(b)) return false;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (let i = 0; i < aKeys.length; i++) {
+    const key = aKeys[i];
+    if (a[key] !== b[key]) return false;
+  }
+  return true;
+};
+const hasChangedProps = (oldProps: any, newProps: any) => {
+  const oldKeys = Object.keys(oldProps);
+  const newKeys = Object.keys(newProps);
+  if (oldKeys.length !== newKeys.length) return true;
+  for (let i = 0; i < newKeys.length; i++) {
+    const key = newKeys[i];
+    const oldValue = oldProps[key];
+    const newValue = newProps[key];
+    // Event handlers are often recreated per render. Ignore by default.
+    // Set globalThis.__METTLE_COMPARE_FUNCTION_PROPS__ = true to compare all functions.
+    if (typeof oldValue === 'function' && typeof newValue === 'function') {
+      if (!shouldCompareFunctionProps() && isEventPropKey(key)) {
+        continue;
+      }
+      if (oldValue !== newValue) {
+        return true;
+      }
+      continue;
+    }
+    // Avoid remount when style objects are structurally equal.
+    if (key === 'style' && isObject(oldValue) && isObject(newValue)) {
+      if (!shallowEqualObject(oldValue, newValue)) {
+        return true;
+      }
+      continue;
+    }
+    if (oldValue !== newValue) {
+      return true;
+    }
+  }
+  return false;
+};
 function warn(msg: any) {
   console.warn(`[Mettle.js warn]: ${msg}`);
 }
-function setStyleProp(el: HTMLElement, prototype: { [key: string]: string }) {
-  Object.assign(el.style, prototype);
+function safeRemoveChild(parent: any, child: any, context = 'unknown') {
+  incRuntimeStat('safeRemoveChild.call');
+  if (!parent || !child) {
+    incRuntimeStat('safeRemoveChild.fail.missing_node');
+    warn(`[safeRemoveChild:${context}] parent or child is missing.`);
+    if (readRuntimeFlag(RUNTIME_FLAG_KEYS.strictErrors)) {
+      throw new TypeError(`[safeRemoveChild:${context}] parent or child is missing.`);
+    }
+    return false;
+  }
+  if (child.parentNode !== parent) {
+    incRuntimeStat('safeRemoveChild.fail.parent_mismatch');
+    warn(`[safeRemoveChild:${context}] child is not attached to parent.`);
+    if (readRuntimeFlag(RUNTIME_FLAG_KEYS.strictErrors)) {
+      throw new TypeError(`[safeRemoveChild:${context}] child is not attached to parent.`);
+    }
+    return false;
+  }
+  parent.removeChild(child);
+  incRuntimeStat('safeRemoveChild.success');
+  return true;
+}
+function safeInsertBefore(parent: any, child: any, anchor: any, context = 'unknown') {
+  incRuntimeStat('safeInsertBefore.call');
+  if (!parent || !child) {
+    incRuntimeStat('safeInsertBefore.fail.missing_node');
+    warn(`[safeInsertBefore:${context}] parent or child is missing.`);
+    if (readRuntimeFlag(RUNTIME_FLAG_KEYS.strictErrors)) {
+      throw new TypeError(`[safeInsertBefore:${context}] parent or child is missing.`);
+    }
+    return false;
+  }
+  const safeAnchor = anchor && anchor.parentNode === parent ? anchor : null;
+  if (anchor && safeAnchor === null) {
+    incRuntimeStat('safeInsertBefore.anchor_mismatch');
+  }
+  parent.insertBefore(child, safeAnchor);
+  incRuntimeStat('safeInsertBefore.success');
+  return true;
+}
+function getLifecycleTargetName(target: any) {
+  if (!target) return 'unknown';
+  if (typeof target === 'function') return target.name || 'anonymous-fn';
+  if (target.tag && typeof target.tag === 'function')
+    return target.tag.name || 'anonymous-component';
+  if (target.tag && typeof target.tag === 'string') return target.tag;
+  return 'unknown-target';
+}
+function debugLifecycle(message: string, payload: any) {
+  if (!readRuntimeFlag(RUNTIME_FLAG_KEYS.debugLifecycle)) return;
+  // eslint-disable-next-line no-console
+  console.log(`[Mettle.js lifecycle] ${message}`, payload);
+}
+function setStyleProp(el: HTMLElement, nextStyle: any, prevStyle: any | null = null) {
+  if (!isObject(nextStyle)) return;
+  const style = el.style;
+  if (isObject(prevStyle)) {
+    const prevKeys = Object.keys(prevStyle);
+    for (let i = 0; i < prevKeys.length; i++) {
+      const key = prevKeys[i];
+      if (!hasOwn(nextStyle, key)) {
+        (style as any)[key] = '';
+      }
+    }
+  }
+  const nextKeys = Object.keys(nextStyle);
+  for (let i = 0; i < nextKeys.length; i++) {
+    const key = nextKeys[i];
+    const nextValue = nextStyle[key];
+    if (!isObject(prevStyle) || prevStyle[key] !== nextValue) {
+      (style as any)[key] = nextValue;
+    }
+  }
 }
 function addEventListener(
   el: HTMLElement,
   name: string,
-  listener: EventListenerOrEventListenerObject
+  listener: EventListenerOrEventListenerObject,
 ) {
   if (typeof listener !== 'function') return;
 
@@ -75,7 +246,7 @@ function addEventListener(
 function removeEventListener(
   el: HTMLElement,
   name: string,
-  listener: EventListenerOrEventListenerObject
+  listener: EventListenerOrEventListenerObject,
 ) {
   if (typeof listener !== 'function') return;
 
@@ -92,6 +263,22 @@ const BOOLEAN_ATTRS = new Set([
   'hidden',
 ]);
 function setAttribute(el: HTMLElement, key: string, value: string) {
+  if (key === 'value') {
+    // Keep input/textarea/select in sync with reactive state.
+    const normalized = value == null ? '' : value;
+    if ((el as any).value !== normalized) {
+      (el as any).value = normalized;
+    }
+    el.setAttribute(key, normalized);
+    return;
+  }
+  if (key === 'checked' || key === 'selected' || key === 'disabled' || key === 'readonly') {
+    const boolValue = !!value;
+    const propKey = key === 'readonly' ? 'readOnly' : key;
+    (el as any)[propKey] = boolValue;
+    boolValue ? el.setAttribute(key, '') : el.removeAttribute(key);
+    return;
+  }
   if (BOOLEAN_ATTRS.has(key)) {
     value ? el.setAttribute(key, '') : el.removeAttribute(key);
     return;
@@ -105,6 +292,13 @@ function setAttribute(el: HTMLElement, key: string, value: string) {
   el.setAttribute(key, value);
 }
 function removeAttribute(el: HTMLElement, key: string) {
+  if (key === 'value') {
+    (el as any).value = '';
+  }
+  if (key === 'checked' || key === 'selected' || key === 'disabled' || key === 'readonly') {
+    const propKey = key === 'readonly' ? 'readOnly' : key;
+    (el as any)[propKey] = false;
+  }
   if (key.startsWith('xlink:')) {
     el.removeAttributeNS(XLINK_NS, key);
     return;
@@ -196,17 +390,151 @@ const domInfo = new WeakMap();
 
 // Memo
 let memoMap = new WeakMap();
+// Component effect disposer (target -> dispose fn)
+const effectDisposerMap = new WeakMap();
+// Lifecycle (target-scoped with fallback queues)
+const mountedHookMap = new WeakMap();
+const unMountedHookMap = new WeakMap();
+const activeLifecycleTargets = new Set();
+let mountHook: any[] = [];
+let unMountedHook: any[] = [];
+let lifecycleTargetContext: any | null = null;
 
 // Update text node
 function updateTextNode(val: any, el: Element) {
   el.textContent = val;
 }
 
+function withLifecycleTarget(target: any, fn: () => any) {
+  const prev = lifecycleTargetContext;
+  lifecycleTargetContext = target;
+  try {
+    return fn();
+  } finally {
+    lifecycleTargetContext = prev;
+  }
+}
+function bindEffectDisposer(target: any, dispose: any) {
+  if (!target || typeof dispose !== 'function') return;
+  const oldDispose = effectDisposerMap.get(target);
+  if (typeof oldDispose === 'function' && oldDispose !== dispose) {
+    oldDispose();
+  }
+  effectDisposerMap.set(target, dispose);
+}
+function disposeTargetEffect(target: any) {
+  if (!target) return;
+  const dispose = effectDisposerMap.get(target);
+  if (typeof dispose === 'function') {
+    dispose();
+  }
+  effectDisposerMap.delete(target);
+}
+function aliasComponentRuntimeState(oldTarget: any, newTarget: any) {
+  if (!oldTarget || !newTarget || oldTarget === newTarget) return;
+  const renderedTree = componentMap.get(oldTarget);
+  if (renderedTree) {
+    componentMap.set(newTarget, renderedTree);
+  }
+  const dispose = effectDisposerMap.get(oldTarget);
+  if (typeof dispose === 'function') {
+    effectDisposerMap.set(newTarget, dispose);
+  }
+  const mountedHooks = mountedHookMap.get(oldTarget);
+  if (mountedHooks && mountedHooks.length > 0) {
+    mountedHookMap.set(newTarget, mountedHooks);
+  }
+  const unmountedHooks = unMountedHookMap.get(oldTarget);
+  if (unmountedHooks && unmountedHooks.length > 0) {
+    unMountedHookMap.set(newTarget, unmountedHooks);
+  }
+}
+function pushLifecycleHook(map: any, target: any, fn: any) {
+  const list = map.get(target);
+  if (list) {
+    list.push(fn);
+  } else {
+    map.set(target, [fn]);
+  }
+}
+function bindMounted(target: any | null = null) {
+  if (target !== null && target !== undefined) {
+    const hooks = mountedHookMap.get(target);
+    if (hooks && hooks.length > 0) {
+      debugLifecycle('run mounted hooks', {
+        target: getLifecycleTargetName(target),
+        count: hooks.length,
+      });
+      for (let i = 0, j = hooks.length; i < j; i++) {
+        hooks[i] && hooks[i]();
+      }
+      mountedHookMap.delete(target);
+    }
+    activeLifecycleTargets.add(target);
+  }
+  if (mountHook.length > 0) {
+    for (let i = 0, j = mountHook.length; i < j; i++) {
+      mountHook[i] && mountHook[i]();
+    }
+    mountHook = [];
+  }
+}
+function bindUnmounted(target: any | null = null) {
+  if (target !== null && target !== undefined) {
+    disposeTargetEffect(target);
+    const hooks = unMountedHookMap.get(target);
+    if (hooks && hooks.length > 0) {
+      debugLifecycle('run unmounted hooks', {
+        target: getLifecycleTargetName(target),
+        count: hooks.length,
+      });
+      for (let i = 0, j = hooks.length; i < j; i++) {
+        hooks[i] && hooks[i]();
+      }
+      unMountedHookMap.delete(target);
+    }
+    activeLifecycleTargets.delete(target);
+    return;
+  }
+  const targets = Array.from(activeLifecycleTargets);
+  for (let i = 0; i < targets.length; i++) {
+    bindUnmounted(targets[i]);
+  }
+  if (unMountedHook.length > 0) {
+    for (let i = 0, j = unMountedHook.length; i < j; i++) {
+      unMountedHook[i] && unMountedHook[i]();
+    }
+    unMountedHook = [];
+  }
+}
+function traverseUnmount(vnode: any) {
+  if (!isVnode(vnode)) return;
+  if (typeof vnode.tag === 'function') {
+    debugLifecycle('traverse component unmount', {
+      target: getLifecycleTargetName(vnode),
+    });
+    const renderedTree = componentMap.get(vnode);
+    bindUnmounted(vnode);
+    if (renderedTree) {
+      traverseUnmount(renderedTree);
+    }
+    return;
+  }
+  const children = vnode.children;
+  if (Array.isArray(children)) {
+    for (let i = 0; i < children.length; i++) {
+      traverseUnmount(children[i]);
+    }
+  } else if (isVnode(children)) {
+    traverseUnmount(children);
+  }
+}
+
 // Convert virtual dom to real dom
 function mount(
   vnode: vnodeType,
   container?: Element | DocumentFragment | Comment | null,
-  anchor?: Element | DocumentFragment | Comment | null
+  anchor?: Element | DocumentFragment | Comment | null,
 ) {
   const { tag, props, children } = vnode;
   if (isUndef(tag)) return;
@@ -265,10 +593,14 @@ function mount(
       return el;
     }
   } else if (typeof tag === 'function') {
-    const template = tag.call(tag, props, tag, memo.bind(tag));
-    const newTree = effectFn(template, tag);
-    componentMap.set(tag, newTree);
-    mount(newTree, container);
+    const template = withLifecycleTarget(vnode, () => tag.call(tag, props, tag, memo.bind(vnode)));
+    const newTree = effectFn(template, vnode);
+    componentMap.set(vnode, newTree);
+    const childEl = mount(newTree, container, anchor);
+    // Ensure component vnodes also expose a stable DOM anchor for keyed diff.
+    vnode.el = (newTree as any)?.el || childEl;
+    bindMounted(vnode);
+    return vnode.el;
   }
 }
 
@@ -280,35 +612,70 @@ function patch(oNode: vnodeType, nNode: vnodeType, memoFlag?: symbol) {
     return;
   }
   if (!notTagComponent(oNode, nNode)) {
+    // Keep component vnode DOM anchor across tree replacement.
+    nNode.el = oNode.el;
+    const parent = oNode.el?.parentNode;
+    const anchor = oNode.el?.nextSibling;
+    const sameComponent = checkSameVnode(oNode, nNode);
+    const changedProps = hasChangedProps(oNode.props || {}, nNode.props || {});
+    if (!sameComponent || changedProps) {
+      if (sameComponent && shouldUseComponentPatchFirst()) {
+        try {
+          const oldRenderedTree = componentMap.get(oNode);
+          if (oldRenderedTree && typeof oNode.tag === 'function') {
+            const nextTemplate = withLifecycleTarget(oNode, () =>
+              oNode.tag.call(oNode.tag, nNode.props, oNode.tag, memo.bind(oNode)),
+            );
+            const nextRenderedTree = nextTemplate();
+            patch(oldRenderedTree, nextRenderedTree, memoFlag);
+            componentMap.set(oNode, nextRenderedTree);
+            aliasComponentRuntimeState(oNode, nNode);
+            nNode.el = nextRenderedTree.el || oNode.el;
+            debugLifecycle('component patch-first path', {
+              target: getLifecycleTargetName(oNode),
+            });
+            return;
+          }
+        } catch (err) {
+          warn(err);
+          debugLifecycle('component patch-first fallback remount', {
+            target: getLifecycleTargetName(oNode),
+          });
+        }
+      }
+      if (parent && oNode.el) {
+        traverseUnmount(oNode);
+        safeRemoveChild(parent, oNode.el, 'patch-component-remount');
+        mount(nNode, parent, anchor);
+      }
+      return;
+    }
+    // Same component and props unchanged: keep runtime state addressable by new vnode.
+    aliasComponentRuntimeState(oNode, nNode);
     return;
   }
   if (!checkSameVnode(oNode, nNode)) {
     const parent = oNode.el.parentNode;
     const anchor = oNode.el.nextSibling;
-    parent.removeChild(oNode.el);
+    traverseUnmount(oNode);
+    safeRemoveChild(parent, oNode.el, 'patch-replace-node');
     mount(nNode, parent, anchor);
   } else {
     const el = (nNode.el = oNode.el);
     // props
     const oldProps = oNode.props || {};
     const newProps = nNode.props || {};
-    const allKeys: any = {};
     const newKeys = Object.keys(newProps);
     const oldKeys = Object.keys(oldProps);
-    const newKeySet = new Set(newKeys);
-    for (let i = 0; i < newKeys.length; i++) {
-      allKeys[newKeys[i]] = true;
-    }
-    for (let i = 0; i < oldKeys.length; i++) {
-      allKeys[oldKeys[i]] = true;
-    }
-    const keys = Object.keys(allKeys);
-    for (let index = 0; index < keys.length; index++) {
-      const key = keys[index];
+    for (let index = 0; index < newKeys.length; index++) {
+      const key = newKeys[index];
       const newValue = newProps[key];
       const oldValue = oldProps[key];
       if (newValue === oldValue) continue;
       if (isUndef(newValue)) {
+        if (typeof oldValue === 'function' && key.startsWith('on')) {
+          removeEventListener(el, key, oldValue);
+        }
         removeAttribute(el, key);
         continue;
       }
@@ -316,14 +683,16 @@ function patch(oNode: vnodeType, nNode: vnodeType, memoFlag?: symbol) {
       const isFunc = typeof newValue === 'function';
       const isStyle = key === 'style';
       if (isFunc) {
-        if (newValue.toString() !== oldValue.toString()) {
+        // Event handlers should be compared by reference.
+        // toString()-based comparison may treat different closures as equal.
+        if (newValue !== oldValue) {
           removeEventListener(el, key, oldValue);
           addEventListener(el, key, newValue);
         }
         continue;
       }
       if (isStyle && newObjType) {
-        setStyleProp(el, newValue);
+        setStyleProp(el, newValue, isObject(oldValue) ? oldValue : null);
         continue;
       }
       const isRegularAttr = key !== 'key' && !isFlag(key);
@@ -333,7 +702,12 @@ function patch(oNode: vnodeType, nNode: vnodeType, memoFlag?: symbol) {
     }
     for (let index = 0; index < oldKeys.length; index++) {
       const key = oldKeys[index];
-      if (!newKeySet.has(key)) {
+      if (!hasOwn(newProps, key)) {
+        const oldValue = oldProps[key];
+        if (typeof oldValue === 'function' && key.startsWith('on')) {
+          removeEventListener(el, key, oldValue);
+          continue;
+        }
         removeAttribute(el, key);
       }
     }
@@ -359,17 +733,11 @@ function patch(oNode: vnodeType, nNode: vnodeType, memoFlag?: symbol) {
 }
 
 // can be all-keyed or mixed
-function patchKeyChildren(
-  n1: Array<vnodeType>,
-  n2: Array<vnodeType>,
-  parentElm: Element,
-  memoFlag?: symbol
-) {
+function patchKeyChildren(n1: any, n2: any, parentElm: any, memoFlag: any) {
   const l2 = n2.length;
   let i = 0;
   let e1 = n1.length - 1;
   let e2 = l2 - 1;
-
   while (i <= e1 && i <= e2) {
     if (checkSameVnode(n1[i], n2[i])) {
       patch(n1[i], n2[i], memoFlag);
@@ -378,7 +746,6 @@ function patchKeyChildren(
     }
     i++;
   }
-
   while (i <= e1 && i <= e2) {
     if (checkSameVnode(n1[e1], n2[e2])) {
       patch(n1[e1], n2[e2], memoFlag);
@@ -388,50 +755,46 @@ function patchKeyChildren(
     e1--;
     e2--;
   }
-
   if (i > e1) {
     if (i <= e2) {
       const nextPos = e2 + 1;
       const anchor = nextPos < l2 ? n2[nextPos].el : null;
       while (i <= e2) {
-        parentElm.insertBefore(mount(n2[i]), anchor);
+        safeInsertBefore(parentElm, mount(n2[i]), anchor, 'patchKeyChildren-append');
         i++;
       }
     }
   } else if (i > e2) {
     while (i <= e1) {
-      parentElm.removeChild(n1[i].el);
+      traverseUnmount(n1[i]);
+      safeRemoveChild(parentElm, n1[i].el, 'patchKeyChildren-trim-tail');
       i++;
     }
   } else {
     const s1 = i;
     const s2 = i;
-
     const keyToNewIndexMap = new Map();
-
     for (i = s2; i <= e2; i++) {
       const nextChild = n2[i];
       if (nextChild.key != null) {
         keyToNewIndexMap.set(nextChild.key, i);
       }
     }
-
     let j;
     let patched = 0;
     const toBePatched = e2 - s2 + 1;
     let moved = false;
     let maxIndexSoFar = 0;
     const newIndexToOldIndexMap = new Array(toBePatched);
-
     for (i = 0; i < toBePatched; i++) newIndexToOldIndexMap[i] = 0;
-
     for (let i = s1; i <= e1; i++) {
       if (patched >= toBePatched) {
-        parentElm.removeChild(n1[i].el);
+        traverseUnmount(n1[i]);
+        safeRemoveChild(parentElm, n1[i].el, 'patchKeyChildren-overpatched');
         continue;
       }
       let newIndex;
-      if (n1[i].key !== null) {
+      if (n1[i].key != null) {
         newIndex = keyToNewIndexMap.get(n1[i].key);
       } else {
         for (j = s2; j <= e2; j++) {
@@ -442,7 +805,8 @@ function patchKeyChildren(
         }
       }
       if (newIndex === undefined) {
-        parentElm.removeChild(n1[i].el);
+        traverseUnmount(n1[i]);
+        safeRemoveChild(parentElm, n1[i].el, 'patchKeyChildren-remove-missing');
       } else {
         newIndexToOldIndexMap[newIndex - s2] = i + 1;
         if (newIndex > maxIndexSoFar) {
@@ -454,18 +818,16 @@ function patchKeyChildren(
         patched++;
       }
     }
-
     const increasingNewIndexSequence = moved ? getSequence(newIndexToOldIndexMap) : [];
-
     j = increasingNewIndexSequence.length - 1;
     for (let i = toBePatched - 1; i >= 0; i--) {
       const nextIndex = i + s2;
       const anchor = nextIndex + 1 < l2 ? n2[nextIndex + 1].el : null;
       if (newIndexToOldIndexMap[i] === 0) {
-        parentElm.insertBefore(mount(n2[nextIndex]), anchor);
+        safeInsertBefore(parentElm, mount(n2[nextIndex]), anchor, 'patchKeyChildren-insert-new');
       } else if (moved) {
         if (j < 0 || i !== increasingNewIndexSequence[j]) {
-          parentElm.insertBefore(n2[nextIndex].el, anchor);
+          safeInsertBefore(parentElm, n2[nextIndex].el, anchor, 'patchKeyChildren-move');
         } else {
           j--;
         }
@@ -475,13 +837,16 @@ function patchKeyChildren(
 }
 
 // Change data
-function setData(target: any, newTree: vnodeType, memoFlag: any) {
+function setData(target: any, newTree: any, memoFlag: any) {
   try {
     const oldTree = componentMap.get(target);
     patch(oldTree, newTree, memoFlag);
     componentMap.set(target, newTree);
   } catch (err) {
     warn(err);
+    if (readRuntimeFlag(RUNTIME_FLAG_KEYS.strictErrors)) {
+      throw err;
+    }
   }
 }
 
@@ -495,22 +860,25 @@ function memo(fn: any, name: any) {
 
 // Effect
 function effectFn(template: any, target: any) {
-  let initMode = true;
-  effect(() => {
+  let currentTree;
+  let initialized = false;
+  const dispose = effect(() => {
     target.template = template;
-    const newTree = template();
-    if (initMode) {
-      initMode = null;
+    const newTree = withLifecycleTarget(target, () => template());
+    if (!initialized) {
+      initialized = true;
+      currentTree = newTree;
     } else {
       const memoFlag = memoMap.get(target);
       setData(target, newTree, memoFlag);
       if (memoMap.has(target)) {
-        memoMap = new WeakMap();
+        memoMap.delete(target);
       }
+      currentTree = newTree;
     }
   });
-
-  return template();
+  bindEffectDisposer(target, dispose);
+  return currentTree;
 }
 
 // Normalize Container
@@ -548,75 +916,76 @@ function normalizeContainer(container: Element | DocumentFragment | Comment | nu
 
 let _el: any = Object.create(null);
 // Create Mettle application
-function createApp(root: any, container: string) {
+function createApp(root: any, container: any) {
   const rootContent = root.tag;
-  const template = rootContent.call(rootContent, root.props, rootContent, memo.bind(rootContent));
-  const newTree = effectFn(template, rootContent);
+  const template = withLifecycleTarget(root, () =>
+    rootContent.call(rootContent, root.props, rootContent, memo.bind(root)),
+  );
+  const newTree = effectFn(template, root);
   const mountNodeEl = normalizeContainer(container);
   mount(newTree, mountNodeEl);
-  componentMap.set(rootContent, newTree);
+  componentMap.set(root, newTree);
   _el = mountNodeEl;
-  bindMounted();
+  bindMounted(root);
 }
 
 // onMounted
-let mountHook: any[] = [];
-let unMountedHookCount = 0;
-let oldunMountedHookCount = 0;
-function onMounted(fn: any = null) {
+function onMounted(fn: any | null = null) {
   if (fn === null) return;
   if (typeof fn !== 'function') {
     warn('The parameter of onMounted is not a function!');
     return;
   }
-  mountHook.push(fn);
-}
-function bindMounted() {
-  if (mountHook.length > 0) {
-    for (let i = 0, j = mountHook.length; i < j; i++) {
-      mountHook[i] && mountHook[i]();
-    }
+  if (lifecycleTargetContext !== null && lifecycleTargetContext !== undefined) {
+    debugLifecycle('register mounted hook', {
+      target: getLifecycleTargetName(lifecycleTargetContext),
+    });
+    pushLifecycleHook(mountedHookMap, lifecycleTargetContext, fn);
+  } else {
+    debugLifecycle('register mounted hook (fallback queue)', {});
+    mountHook.push(fn);
   }
-
-  oldunMountedHookCount = unMountedHookCount;
-  unMountedHookCount = 0;
-
-  mountHook = [];
 }
 
 // onUnmounted
-let unMountedHook: any[] = [];
-function onUnmounted(fn: any = null) {
+function onUnmounted(fn: any | null = null) {
   if (fn === null) return;
   if (typeof fn !== 'function') {
     warn('The parameter of onUnmounted is not a function!');
     return;
   }
-
-  unMountedHookCount += 1;
-  unMountedHook.push(fn);
-}
-function bindUnmounted() {
-  if (unMountedHook.length > 0) {
-    for (let i = 0; i < oldunMountedHookCount; i++) {
-      unMountedHook[i] && unMountedHook[i]();
-    }
-    unMountedHook.splice(0, oldunMountedHookCount);
+  if (lifecycleTargetContext !== null && lifecycleTargetContext !== undefined) {
+    debugLifecycle('register unmounted hook', {
+      target: getLifecycleTargetName(lifecycleTargetContext),
+    });
+    pushLifecycleHook(unMountedHookMap, lifecycleTargetContext, fn);
+  } else {
+    debugLifecycle('register unmounted hook (fallback queue)', {});
+    unMountedHook.push(fn);
   }
-
-  oldunMountedHookCount = unMountedHookCount;
 }
 
 // Reset view
-function resetView(view: any, routerContainer?: string) {
+function resetView(view: any, routerContainer: any) {
   bindUnmounted();
   const routerContainerEl = routerContainer ? normalizeContainer(routerContainer) : _el;
   routerContainerEl.innerHTML = '';
-  const template = view.call(view, view, memo.bind(view));
+  const template = withLifecycleTarget(view, () => view.call(view, view, memo.bind(view)));
   const newTree = effectFn(template, view);
   mount(newTree, routerContainerEl);
   componentMap.set(view, newTree);
-  bindMounted();
+  bindMounted(view);
 }
 
-export { version, createApp, domInfo, onMounted, onUnmounted, resetView };
+export {
+  version,
+  createApp,
+  domInfo,
+  onMounted,
+  onUnmounted,
+  resetView,
+  trackEffectDisposed,
+  trackEffectCreated,
+  getRuntimeStatsSnapshot,
+  resetRuntimeStats,
+};

@@ -1,3 +1,5 @@
+import { trackEffectDisposed, trackEffectCreated } from './core';
+
 const BRAND_SYMBOL = Symbol.for('signals');
 
 const RUNNING = 1 << 0;
@@ -259,7 +261,7 @@ Signal.prototype.subscribe = function (fn) {
         evalContext = prevContext;
       }
     },
-    { name: 'sub' }
+    { name: 'sub' },
   );
 };
 Signal.prototype.valueOf = function () {
@@ -524,6 +526,7 @@ function cleanupEffect(effect: Effect) {
   }
 }
 function disposeEffect(effect: Effect) {
+  trackEffectDisposed(effect);
   for (let node = effect._sources; node !== undefined; node = node._nextSource) {
     node._source._unsubscribe(node);
   }
@@ -557,6 +560,7 @@ declare class Effect {
   _nextBatchedEffect?: Effect;
   _flags: number;
   name?: string;
+  _statsDisposed: boolean;
 
   constructor(fn: EffectFn, options?: EffectOptions);
 
@@ -576,7 +580,9 @@ function Effect(this: Effect, fn: EffectFn, options?: EffectOptions) {
   this._sources = undefined;
   this._nextBatchedEffect = undefined;
   this._flags = TRACKING;
+  this._statsDisposed = false;
   this.name = options?.name;
+  trackEffectCreated();
 }
 Effect.prototype._callback = function () {
   const finish = this._start();
